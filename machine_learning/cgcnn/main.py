@@ -11,13 +11,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn import metrics
-from torch.autograd import Variable
 from torch.optim.lr_scheduler import MultiStepLR
 
-from cgcnn.data import CIFData
-from cgcnn.data import collate_pool, get_train_val_test_loader
+from cgcnn.data import CIFData, get_train_val_test_loader
 from cgcnn.model import CrystalGraphConvNet
+from cgcnn.utils import AverageMeter, Normalizer, class_eval, mae
 
 parser = argparse.ArgumentParser(
     description='Crystal Graph Convolutional Neural Networks')
@@ -80,13 +78,14 @@ parser.add_argument('--n-conv', default=3, type=int, metavar='N',
 parser.add_argument('--n-h', default=1, type=int, metavar='N',
                     help='number of hidden layers after pooling')
 parser.add_argument('--disable-save-torch', action='store_true',
-                    help='Do not save CIF PyTorch data as .pkl files')
+                    help='Do not save processed crystal graphs as .pt files')
 parser.add_argument('--clean-torch', action='store_true',
-                    help='Clean CIF PyTorch data .pkl files')
+                    help='Clean processed crystal graph .pt files')
 
 args = parser.parse_args(sys.argv[1:])
 
 args.cuda = not args.disable_cuda and torch.cuda.is_available()
+device = torch.device('cuda' if args.cuda else 'cpu')
 
 if args.task == 'regression':
     best_mae_error = 1e10
@@ -100,10 +99,8 @@ def main():
     # load data
     dataset = CIFData(*args.data_options,
                       disable_save_torch=args.disable_save_torch)
-    collate_fn = collate_pool
     train_loader, val_loader, test_loader = get_train_val_test_loader(
         dataset=dataset,
-        collate_fn=collate_fn,
         batch_size=args.batch_size,
         train_ratio=args.train_ratio,
         num_workers=args.workers,
@@ -120,26 +117,26 @@ def main():
         total_train = 0
         total_val = 0
         total_test = 0
-        for i, (_, target, _) in enumerate(train_loader):
-            for target_i in target.squeeze():
+        for batch in train_loader:
+            for target_i in batch.y.squeeze():
                 total_train += target_i
         if bool(total_train == 0):
             raise ValueError('All 0s in train')
         elif bool(total_train == 1):
             raise ValueError('All 1s in train')
-        for i, (_, target, _) in enumerate(val_loader):
-            if len(target) == 1:
+        for batch in val_loader:
+            if len(batch.y) == 1:
                 raise ValueError('Only single entry in val')
-            for target_i in target.squeeze():
+            for target_i in batch.y.squeeze():
                 total_val += target_i
         if bool(total_val == 0):
             raise ValueError('All 0s in val')
         elif bool(total_val == 1):
             raise ValueError('All 1s in val')
-        for i, (_, target, _) in enumerate(test_loader):
-            if len(target) == 1:
+        for batch in test_loader:
+            if len(batch.y) == 1:
                 raise ValueError('Only single entry in test')
-            for target_i in target.squeeze():
+            for target_i in batch.y.squeeze():
                 total_test += target_i
         if bool(total_test == 0):
             raise ValueError('All 0s in test')
@@ -154,12 +151,9 @@ def main():
     torch_data_path = os.path.join(args.data_options[0], 'cifdata')
     if args.clean_torch and os.path.exists(torch_data_path):
         shutil.rmtree(torch_data_path)
-    if os.path.exists(torch_data_path):
-        if not args.clean_torch:
-            warnings.warn('Found cifdata folder at ' +
-                          torch_data_path+'. Will read in .pkls as-available')
-    else:
-        os.mkdir(torch_data_path)
+    if os.path.exists(torch_data_path) and not args.clean_torch:
+        warnings.warn('Found cifdata folder at ' +
+                      torch_data_path+'. Will read in .pt files as-available')
 
     # obtain target value normalizer
     if args.task == 'classification':
@@ -169,17 +163,17 @@ def main():
         if len(dataset) < 500:
             warnings.warn('Dataset has less than 500 data points. '
                           'Lower accuracy is expected. ')
-            sample_data_list = [dataset[i] for i in range(len(dataset))]
+            sample_idx = range(len(dataset))
         else:
-            sample_data_list = [dataset[i] for i in
-                                sample(range(len(dataset)), 500)]
-        _, sample_target, _ = collate_pool(sample_data_list)
+            sample_idx = sample(range(len(dataset)), 500)
+        sample_target = torch.tensor(
+            [[float(dataset.id_prop_data[i][1])] for i in sample_idx])
         normalizer = Normalizer(sample_target)
 
     # build model
-    structures, _, _ = dataset[0]
-    orig_atom_fea_len = structures[0].shape[-1]
-    nbr_fea_len = structures[1].shape[-1]
+    sample_graph = dataset[0]
+    orig_atom_fea_len = sample_graph.x.shape[-1]
+    nbr_fea_len = sample_graph.edge_attr.shape[-1]
     model = CrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len,
                                 atom_fea_len=args.atom_fea_len,
                                 n_conv=args.n_conv,
@@ -187,8 +181,7 @@ def main():
                                 n_h=args.n_h,
                                 classification=True if args.task ==
                                 'classification' else False)
-    if args.cuda:
-        model.cuda()
+    model.to(device)
 
     # define loss func and optimizer
     if args.task == 'classification':
@@ -209,7 +202,7 @@ def main():
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            checkpoint = torch.load(args.resume, map_location=device)
             args.start_epoch = checkpoint['epoch']
             best_mae_error = checkpoint['best_mae_error']
             model.load_state_dict(checkpoint['state_dict'])
@@ -253,7 +246,8 @@ def main():
         }, is_best)
 
     # test best model
-    best_checkpoint = torch.load(os.path.join('output', 'model_best.pth.tar'))
+    best_checkpoint = torch.load(os.path.join('output', 'model_best.pth.tar'),
+                                 map_location=device)
     model.load_state_dict(best_checkpoint['state_dict'])
     print('---------Evaluate Best Model on Train Set---------------')
     validate(train_loader, model, criterion, normalizer, test=True,
@@ -283,36 +277,28 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
     model.train()
 
     end = time.time()
-    for i, (input_, target, _) in enumerate(train_loader):
+    for i, batch in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.cuda:
-            input_var = (Variable(input_[0].cuda(non_blocking=True)),
-                         Variable(input_[1].cuda(non_blocking=True)),
-                         input_[2].cuda(non_blocking=True),
-                         [crys_idx.cuda(non_blocking=True) for crys_idx in input_[3]])
-        else:
-            input_var = input_
+        batch = batch.to(device, non_blocking=True)
+        target = batch.y.cpu()
 
         # normalize target
         if args.task == 'regression':
-            target_normed = normalizer.norm(target)
+            target_var = normalizer.norm(batch.y)
         else:
-            target_normed = target.view(-1).long()
-        if args.cuda:
-            target_var = Variable(target_normed.cuda(non_blocking=True))
-        else:
-            target_var = Variable(target_normed)
+            target_var = batch.y.view(-1).long()
 
         # compute output
-        output = model(*input_var)
+        output = model(batch.x, batch.edge_index, batch.edge_attr,
+                       batch.batch)
         loss = criterion(output, target_var)
 
         # measure accuracy and record loss
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
-            losses.update(loss.data.cpu(), target.size(0))
+            losses.update(loss.data.cpu().item(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
         else:
             accuracy, precision, recall, fscore, auc_score = \
@@ -380,30 +366,20 @@ def validate(val_loader, model, criterion, normalizer, test=False, csv_name='tes
     model.eval()
 
     end = time.time()
-    for i, (input_, target, batch_cif_ids) in enumerate(val_loader):
-        if args.cuda:
-            with torch.no_grad():
-                input_var = (Variable(input_[0].cuda(non_blocking=True)),
-                             Variable(input_[1].cuda(non_blocking=True)),
-                             input_[2].cuda(non_blocking=True),
-                             [crys_idx.cuda(non_blocking=True) for crys_idx in input_[3]])
-        else:
-            with torch.no_grad():
-                input_var = input_
+    for i, batch in enumerate(val_loader):
+        batch = batch.to(device, non_blocking=True)
+        target = batch.y.cpu()
+        batch_cif_ids = batch.cif_id
         if args.task == 'regression':
-            target_normed = normalizer.norm(target)
+            target_var = normalizer.norm(batch.y)
         else:
-            target_normed = target.view(-1).long()
-        if args.cuda:
-            with torch.no_grad():
-                target_var = Variable(target_normed.cuda(non_blocking=True))
-        else:
-            with torch.no_grad():
-                target_var = Variable(target_normed)
+            target_var = batch.y.view(-1).long()
 
         # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        with torch.no_grad():
+            output = model(batch.x, batch.edge_index, batch.edge_attr,
+                           batch.batch)
+            loss = criterion(output, target_var)
 
         # measure accuracy and record loss
         if args.task == 'regression':
@@ -480,78 +456,6 @@ def validate(val_loader, model, criterion, normalizer, test=False, csv_name='tes
         print(' {star} AUC {auc.avg:.3f}'.format(star=star_label,
                                                  auc=auc_scores))
         return auc_scores.avg
-
-
-class Normalizer(object):
-    """Normalize a Tensor and restore it later. """
-
-    def __init__(self, tensor):
-        """tensor is taken as a sample to calculate the mean and std"""
-        self.mean = torch.mean(tensor)
-        self.std = torch.std(tensor)
-
-    def norm(self, tensor):
-        return (tensor - self.mean) / self.std
-
-    def denorm(self, normed_tensor):
-        return normed_tensor * self.std + self.mean
-
-    def state_dict(self):
-        return {'mean': self.mean,
-                'std': self.std}
-
-    def load_state_dict(self, state_dict):
-        self.mean = state_dict['mean']
-        self.std = state_dict['std']
-
-
-def mae(prediction, target):
-    """
-    Computes the mean absolute error between prediction and target
-
-    Parameters
-    ----------
-
-    prediction: torch.Tensor (N, 1)
-    target: torch.Tensor (N, 1)
-    """
-    return torch.mean(torch.abs(target - prediction))
-
-
-def class_eval(prediction, target):
-    prediction = np.exp(prediction.numpy())
-    target = target.numpy()
-    pred_label = np.argmax(prediction, axis=1)
-    target_label = np.squeeze(target)
-    if not target_label.shape:
-        target_label = np.asarray([target_label])
-    if prediction.shape[1] == 2:
-        precision, recall, fscore, _ = metrics.precision_recall_fscore_support(
-            target_label, pred_label, average='binary')
-        auc_score = metrics.roc_auc_score(target_label, prediction[:, 1])
-        accuracy = metrics.accuracy_score(target_label, pred_label)
-    else:
-        raise NotImplementedError
-    return accuracy, precision, recall, fscore, auc_score
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
 
 
 def save_checkpoint(state, is_best, filename=os.path.join('output', 'checkpoint.pth.tar')):

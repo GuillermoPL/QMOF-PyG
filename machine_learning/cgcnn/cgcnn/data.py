@@ -1,33 +1,30 @@
 import csv
-import functools
 import json
 import os
 import random
 import warnings
-import pickle
 
 import numpy as np
 import torch
 from pymatgen.core.structure import Structure
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.dataloader import default_collate
-from torch.utils.data.sampler import SubsetRandomSampler
+from torch_geometric.data import Data, Dataset
+from torch_geometric.loader import DataLoader
 
 
-def get_train_val_test_loader(dataset, collate_fn=default_collate,
-                              batch_size=64, train_ratio=None,
+def get_train_val_test_loader(dataset, batch_size=64, train_ratio=None,
                               val_ratio=0.1, test_ratio=0.1, return_test=False,
-                              num_workers=1, pin_memory=False, **kwargs):
+                              num_workers=0, pin_memory=False,
+                              train_size=None, val_size=None, test_size=None):
     """
     Utility function for dividing a dataset to train, val, test datasets.
 
     !!! The dataset needs to be shuffled before using the function !!!
+    (CIFData shuffles itself using its `random_seed`.)
 
     Parameters
     ----------
-    dataset: torch.utils.data.Dataset
+    dataset: torch_geometric.data.Dataset
       The full dataset to be divided.
-    collate_fn: torch.utils.data.DataLoader
     batch_size: int
     train_ratio: float
     val_ratio: float
@@ -37,16 +34,16 @@ def get_train_val_test_loader(dataset, collate_fn=default_collate,
       data will be hidden.
     num_workers: int
     pin_memory: bool
+    train_size, val_size, test_size: int
+      Absolute sizes. If given, they override the corresponding ratio.
 
     Returns
     -------
-    train_loader: torch.utils.data.DataLoader
-      DataLoader that random samples the training data.
-    val_loader: torch.utils.data.DataLoader
-      DataLoader that random samples the validation data.
-    (test_loader): torch.utils.data.DataLoader
-      DataLoader that random samples the test data, returns if
-        return_test=True.
+    train_loader: torch_geometric.loader.DataLoader
+      DataLoader that randomly samples the training data.
+    val_loader: torch_geometric.loader.DataLoader
+    (test_loader): torch_geometric.loader.DataLoader
+      Returned if return_test=True.
     """
     total_size = len(dataset)
     if train_ratio is None:
@@ -55,97 +52,29 @@ def get_train_val_test_loader(dataset, collate_fn=default_collate,
         print('[Warning] train_ratio is None, using all training data.')
     else:
         assert train_ratio + val_ratio + test_ratio <= 1
-    indices = list(range(total_size))
-    if kwargs['train_size']:
-        train_size = kwargs['train_size']
-    else:
+    if not train_size:
         train_size = int(train_ratio * total_size)
-    if kwargs['test_size']:
-        test_size = kwargs['test_size']
-    else:
+    if not test_size:
         test_size = int(test_ratio * total_size)
-    if kwargs['val_size']:
-        valid_size = kwargs['val_size']
-    else:
-        valid_size = int(val_ratio * total_size)
-    train_sampler = SubsetRandomSampler(indices[:train_size])
-    val_sampler = SubsetRandomSampler(
-        indices[-(valid_size + test_size):-test_size])
+    if not val_size:
+        val_size = int(val_ratio * total_size)
+
+    indices = list(range(total_size))
+    train_idx = indices[:train_size]
+    val_idx = indices[total_size - (val_size + test_size):
+                      total_size - test_size]
+    test_idx = indices[total_size - test_size:]
+
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers,
+                         pin_memory=pin_memory)
+    train_loader = DataLoader(dataset[train_idx], shuffle=True,
+                              **loader_kwargs)
+    val_loader = DataLoader(dataset[val_idx], shuffle=False, **loader_kwargs)
     if return_test:
-        test_sampler = SubsetRandomSampler(indices[-test_size:])
-    train_loader = DataLoader(dataset, batch_size=batch_size,
-                              sampler=train_sampler,
-                              num_workers=num_workers,
-                              collate_fn=collate_fn, pin_memory=pin_memory)
-    val_loader = DataLoader(dataset, batch_size=batch_size,
-                            sampler=val_sampler,
-                            num_workers=num_workers,
-                            collate_fn=collate_fn, pin_memory=pin_memory)
-    if return_test:
-        test_loader = DataLoader(dataset, batch_size=batch_size,
-                                 sampler=test_sampler,
-                                 num_workers=num_workers,
-                                 collate_fn=collate_fn, pin_memory=pin_memory)
-    if return_test:
+        test_loader = DataLoader(dataset[test_idx], shuffle=False,
+                                 **loader_kwargs)
         return train_loader, val_loader, test_loader
-    else:
-        return train_loader, val_loader
-
-
-def collate_pool(dataset_list):
-    """
-    Collate a list of data and return a batch for predicting crystal
-    properties.
-
-    Parameters
-    ----------
-
-    dataset_list: list of tuples for each data point.
-      (atom_fea, nbr_fea, nbr_fea_idx, target)
-
-      atom_fea: torch.Tensor shape (n_i, atom_fea_len)
-      nbr_fea: torch.Tensor shape (n_i, M, nbr_fea_len)
-      nbr_fea_idx: torch.LongTensor shape (n_i, M)
-      target: torch.Tensor shape (1, )
-      cif_id: str or int
-
-    Returns
-    -------
-    N = sum(n_i); N0 = sum(i)
-
-    batch_atom_fea: torch.Tensor shape (N, orig_atom_fea_len)
-      Atom features from atom type
-    batch_nbr_fea: torch.Tensor shape (N, M, nbr_fea_len)
-      Bond features of each atom's M neighbors
-    batch_nbr_fea_idx: torch.LongTensor shape (N, M)
-      Indices of M neighbors of each atom
-    crystal_atom_idx: list of torch.LongTensor of length N0
-      Mapping from the crystal idx to atom idx
-    target: torch.Tensor shape (N, 1)
-      Target value for prediction
-    batch_cif_ids: list
-    """
-    batch_atom_fea, batch_nbr_fea, batch_nbr_fea_idx = [], [], []
-    crystal_atom_idx, batch_target = [], []
-    batch_cif_ids = []
-    base_idx = 0
-    for i, ((atom_fea, nbr_fea, nbr_fea_idx), target, cif_id)\
-            in enumerate(dataset_list):
-        n_i = atom_fea.shape[0]  # number of atoms for this crystal
-        batch_atom_fea.append(atom_fea)
-        batch_nbr_fea.append(nbr_fea)
-        batch_nbr_fea_idx.append(nbr_fea_idx+base_idx)
-        new_idx = torch.LongTensor(np.arange(n_i)+base_idx)
-        crystal_atom_idx.append(new_idx)
-        batch_target.append(target)
-        batch_cif_ids.append(cif_id)
-        base_idx += n_i
-    return (torch.cat(batch_atom_fea, dim=0),
-            torch.cat(batch_nbr_fea, dim=0),
-            torch.cat(batch_nbr_fea_idx, dim=0),
-            crystal_atom_idx),\
-        torch.stack(batch_target, dim=0),\
-        batch_cif_ids
+    return train_loader, val_loader
 
 
 class GaussianDistance(object):
@@ -244,16 +173,16 @@ class AtomCustomJSONInitializer(AtomInitializer):
         elem_embedding = {int(key): value for key, value
                           in elem_embedding.items()}
         atom_types = set(elem_embedding.keys())
-        super(AtomCustomJSONInitializer, self).__init__(atom_types)
+        super().__init__(atom_types)
         for key, value in elem_embedding.items():
             self._embedding[key] = np.array(value, dtype=float)
 
 
 class CIFData(Dataset):
     """
-    The CIFData dataset is a wrapper for a dataset where the crystal structures
-    are stored in the form of CIF files. The dataset should have the following
-    directory structure:
+    PyTorch Geometric dataset where the crystal structures are stored in the
+    form of CIF files. The dataset should have the following directory
+    structure:
 
     root_dir
     ├── id_prop.csv
@@ -286,22 +215,23 @@ class CIFData(Dataset):
     step: float
         The step size for constructing GaussianDistance
     disable_save_torch: bool
-        Don't save torch files containing CIFData crystal graphs
+        Don't save the processed crystal graphs to `root_dir/cifdata/*.pt`
     random_seed: int
         Random seed for shuffling the dataset
 
-    Returns
-    -------
+    Each item is a `torch_geometric.data.Data` with:
 
-    atom_fea: torch.Tensor shape (n_i, atom_fea_len)
-    nbr_fea: torch.Tensor shape (n_i, M, nbr_fea_len)
-    nbr_fea_idx: torch.LongTensor shape (n_i, M)
-    target: torch.Tensor shape (1, )
-    cif_id: str or int
+    x: torch.Tensor shape (n_i, atom_fea_len)
+    edge_index: torch.LongTensor shape (2, n_i * M)
+        edge_index[0] = neighbor atom, edge_index[1] = central atom
+    edge_attr: torch.Tensor shape (n_i * M, nbr_fea_len)
+    y: torch.Tensor shape (1, 1)
+    cif_id: str
     """
 
     def __init__(self, root_dir, max_num_nbr=12, radius=8, dmin=0, step=0.2,
                  disable_save_torch=False, random_seed=42):
+        super().__init__(root=None)
         self.root_dir = root_dir
         self.max_num_nbr, self.radius = max_num_nbr, radius
         self.disable_save_torch = disable_save_torch
@@ -320,54 +250,48 @@ class CIFData(Dataset):
         self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step)
         self.torch_data_path = os.path.join(self.root_dir, 'cifdata')
 
-    def __len__(self):
+    def len(self):
         return len(self.id_prop_data)
 
-    @functools.lru_cache(maxsize=None)  # Cache loaded structures
-    def __getitem__(self, idx):
+    def get(self, idx):
         cif_id, target = self.id_prop_data[idx]
         cif_id = cif_id.replace('ï»¿', '')
-        target = torch.Tensor([float(target)])
 
-        if os.path.exists(os.path.join(self.torch_data_path, cif_id+'.pkl')):
-            with open(os.path.join(self.torch_data_path, cif_id+'.pkl'), 'rb') as f:
-                pkl_data = pickle.load(f)
-                atom_fea = pkl_data[0]
-                nbr_fea = pkl_data[1]
-                nbr_fea_idx = pkl_data[2]
+        cache_file = os.path.join(self.torch_data_path, cif_id + '.pt')
+        if os.path.exists(cache_file):
+            data = torch.load(cache_file, weights_only=False)
         else:
-            crystal = Structure.from_file(os.path.join(self.root_dir,
-                                                       cif_id+'.cif'))
-            atom_fea = np.vstack([self.ari.get_atom_fea(crystal[i].specie.number)
-                                  for i in range(len(crystal))])
-            atom_fea = torch.Tensor(atom_fea)
-            all_nbrs = crystal.get_all_neighbors(
-                self.radius, include_index=True)
-            all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]
-            nbr_fea_idx, nbr_fea = [], []
-            for nbr in all_nbrs:
-                if len(nbr) < self.max_num_nbr:
-                    warnings.warn('{} not find enough neighbors to build graph. '
-                                  'If it happens frequently, consider increase '
-                                  'radius.'.format(cif_id))
-                    nbr_fea_idx.append(list(map(lambda x: x[2], nbr)) +
-                                       [0] * (self.max_num_nbr - len(nbr)))
-                    nbr_fea.append(list(map(lambda x: x[1], nbr)) +
-                                   [self.radius + 1.] * (self.max_num_nbr -
-                                                         len(nbr)))
-                else:
-                    nbr_fea_idx.append(list(map(lambda x: x[2],
-                                                nbr[:self.max_num_nbr])))
-                    nbr_fea.append(list(map(lambda x: x[1],
-                                            nbr[:self.max_num_nbr])))
-            nbr_fea_idx, nbr_fea = np.array(nbr_fea_idx), np.array(nbr_fea)
-            nbr_fea = self.gdf.expand(nbr_fea)
-            atom_fea = torch.Tensor(atom_fea)
-            nbr_fea = torch.Tensor(nbr_fea)
-            nbr_fea_idx = torch.LongTensor(nbr_fea_idx)
+            data = self._build_graph(cif_id)
             if not self.disable_save_torch:
-                with open(os.path.join(self.torch_data_path, cif_id+'.pkl'), 'wb') as f:
-                    pickle.dump(
-                        (atom_fea, nbr_fea, nbr_fea_idx), f)
+                os.makedirs(self.torch_data_path, exist_ok=True)
+                torch.save(data, cache_file)
 
-        return (atom_fea, nbr_fea, nbr_fea_idx), target, cif_id
+        # The target is not cached so id_prop.csv can be edited freely
+        data.y = torch.tensor([[float(target)]], dtype=torch.float)
+        data.cif_id = cif_id
+        return data
+
+    def _build_graph(self, cif_id):
+        crystal = Structure.from_file(os.path.join(self.root_dir,
+                                                   cif_id + '.cif'))
+        atom_fea = np.vstack([self.ari.get_atom_fea(site.specie.number)
+                              for site in crystal])
+        all_nbrs = crystal.get_all_neighbors(self.radius, include_index=True)
+
+        src, dst, dist = [], [], []
+        for center, nbrs in enumerate(all_nbrs):
+            nbrs = sorted(nbrs, key=lambda n: n.nn_distance)
+            if len(nbrs) < self.max_num_nbr:
+                warnings.warn('{} not find enough neighbors to build graph. '
+                              'If it happens frequently, consider increase '
+                              'radius.'.format(cif_id))
+            nbrs = nbrs[:self.max_num_nbr]
+            src += [n.index for n in nbrs]
+            dst += [center] * len(nbrs)
+            dist += [n.nn_distance for n in nbrs]
+
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        edge_attr = torch.tensor(self.gdf.expand(np.array(dist)),
+                                 dtype=torch.float)
+        return Data(x=torch.tensor(atom_fea, dtype=torch.float),
+                    edge_index=edge_index, edge_attr=edge_attr)
